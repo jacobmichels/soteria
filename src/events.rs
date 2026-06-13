@@ -33,10 +33,11 @@ pub enum AuthenticationAgentEvent {
     },
     /// The PAM stack emitted an info or error message, e.g. a fingerprint reader
     /// prompt. Surfaced to the user so non-password methods are usable.
-    Info {
-        cookie: String,
-        message: String,
-    },
+    Info { cookie: String, message: String },
+    /// The PAM stack is asking for a secret. The UI keeps its entry hidden during
+    /// an eager non-password flow until this arrives, so methods like fingerprint
+    /// don't show a confusing password box. `prompt` is the helper's prompt text.
+    SecretRequested { cookie: String, prompt: String },
 }
 
 // Recursive expansion of Debug macro
@@ -91,6 +92,11 @@ impl Debug for AuthenticationAgentEvent {
                 .debug_struct("Info")
                 .field("cookie", &cookie)
                 .field("message", &message)
+                .finish(),
+            Self::SecretRequested { cookie, prompt } => f
+                .debug_struct("SecretRequested")
+                .field("cookie", &cookie)
+                .field("prompt", &prompt)
                 .finish(),
         }
     }

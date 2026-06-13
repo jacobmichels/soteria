@@ -22,6 +22,12 @@ pub struct App {
     cookie: Option<String>,
     retry_message: Option<String>,
     authenticating: bool,
+    /// Whether to show the password entry and its controls. Hidden during an
+    /// eager non-password flow until the PAM stack asks for a secret, so the
+    /// user isn't shown a password box they can't use.
+    show_password: bool,
+    /// Placeholder for the password entry, set from the helper's prompt text.
+    prompt: String,
     sender: mpsc::Sender<AuthenticationUserEvent>, // chosen_identity: Option<String>,
 }
 
@@ -95,6 +101,8 @@ impl AsyncComponent for App {
                 gtk::Box {
                     set_baseline_position: gtk::BaselinePosition::Center,
                     set_spacing: 18,
+                    #[watch]
+                    set_visible: model.show_password,
 
                     #[name = "identity_dropdown"]
                     gtk::DropDown {
@@ -117,10 +125,18 @@ impl AsyncComponent for App {
                 #[name = "password_entry"]
                 gtk::PasswordEntry {
                     set_hexpand: true,
-                    set_placeholder_text: Some( &gettext("Password") ),
+                    #[watch]
+                    set_placeholder_text: Some(model.prompt.as_str()),
                     set_show_peek_icon: true,
                     #[watch]
+                    set_visible: model.show_password,
+                    #[watch]
                     set_editable: !model.authenticating,
+
+                    // Focus the entry whenever it's revealed.
+                    connect_map => move |entry| {
+                        entry.grab_focus();
+                    },
 
                     connect_activate[confirm_button] => move |_| {
                         confirm_button.emit_clicked();
@@ -147,6 +163,8 @@ impl AsyncComponent for App {
 
                     #[name = "confirm_button"]
                     append = &gtk::Button::with_label(&gettext("Confirm")) {
+                        #[watch]
+                        set_visible: model.show_password,
                         connect_clicked[sender, identity_dropdown, password_entry] => move |_| {
                             let user: gtk::StringObject = identity_dropdown.selected_item().unwrap().dynamic_cast().unwrap();
 
@@ -173,6 +191,8 @@ impl AsyncComponent for App {
             cookie: None,
             authenticating: false,
             retry_message: None,
+            show_password: false,
+            prompt: gettext("Password"),
         };
 
         spawn_future_local(clone!(
@@ -226,6 +246,7 @@ impl AsyncComponent for App {
                     self.retry_message = Some(String::new());
                     self.authenticating = false;
                     self.identities = Vec::new();
+                    self.show_password = false;
                 }
             }
             AppMsg::AuthEvent(ev) => match ev {
@@ -240,6 +261,13 @@ impl AsyncComponent for App {
                         self.identities = names.clone();
                         self.authenticating = false;
                         self.retry_message = None;
+                        self.prompt = gettext("Password");
+                        // A single identity spawns the helper eagerly, so a
+                        // non-password method may drive the prompt; keep the entry
+                        // hidden until the stack asks for a secret. With multiple
+                        // identities the user picks one and submits, so it must be
+                        // visible from the start.
+                        self.show_password = names.len() != 1;
                     }
                 }
                 AuthenticationAgentEvent::Canceled { cookie } => {
@@ -250,6 +278,7 @@ impl AsyncComponent for App {
                             self.identities = Vec::new();
                             self.retry_message = None;
                             self.authenticating = false;
+                            self.show_password = false;
                         }
                     }
                 }
@@ -262,6 +291,7 @@ impl AsyncComponent for App {
                             self.identities.clear();
                             self.retry_message = None;
                             self.authenticating = false;
+                            self.show_password = false;
                         }
                     }
                 }
@@ -273,17 +303,36 @@ impl AsyncComponent for App {
                         if c == cookie {
                             self.retry_message = retry_message.clone();
                             self.authenticating = false;
+                            // A failed attempt drops back to the submit-first
+                            // flow, so let the user type a password to retry.
+                            self.show_password = true;
                         }
                     }
                 }
                 AuthenticationAgentEvent::Info { cookie, message } => {
-                    // Surface PAM info/error text (e.g. "Place your finger on the
-                    // reader" or a security-key PIN prompt) in the status label.
-                    // The password entry stays editable so the user can still
-                    // type a password instead of using the alternate method.
+                    // Show PAM info/error text in the status label. Doesn't reveal
+                    // the password entry: a non-password method has no password to
+                    // type.
                     if let Some(c) = &self.cookie {
                         if c == cookie {
                             self.retry_message = Some(message.clone());
+                        }
+                    }
+                }
+                AuthenticationAgentEvent::SecretRequested { cookie, prompt } => {
+                    // The PAM stack wants a secret, so reveal the entry; this is
+                    // also how an eager non-password flow falls through to a
+                    // password. Clear any stale status from the previous method.
+                    if let Some(c) = &self.cookie {
+                        if c == cookie {
+                            self.show_password = true;
+                            self.authenticating = false;
+                            self.retry_message = None;
+                            self.prompt = if prompt.is_empty() {
+                                gettext("Password")
+                            } else {
+                                prompt.clone()
+                            };
                         }
                     }
                 }
