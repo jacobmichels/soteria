@@ -31,6 +31,12 @@ pub enum AuthenticationAgentEvent {
         cookie: String,
         retry_message: Option<String>,
     },
+    /// The PAM stack emitted an info or error message, e.g. a fingerprint reader
+    /// prompt. Surfaced to the user so non-password methods are usable.
+    Info {
+        cookie: String,
+        message: String,
+    },
 }
 
 // Recursive expansion of Debug macro
@@ -80,6 +86,11 @@ impl Debug for AuthenticationAgentEvent {
                 .debug_struct("AuthorizationRetry")
                 .field("cookie", &cookie)
                 .field("retry_message", &retry_message)
+                .finish(),
+            Self::Info { cookie, message } => f
+                .debug_struct("Info")
+                .field("cookie", &cookie)
+                .field("message", &message)
                 .finish(),
         }
     }

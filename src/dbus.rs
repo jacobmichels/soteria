@@ -1,7 +1,7 @@
 use gettextrs::gettext;
 use std::{collections::HashMap, process::Stdio};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines},
     net::UnixStream,
     process,
     sync::mpsc,
@@ -13,6 +13,52 @@ use crate::{
     config::SystemConfig,
     events::{AuthenticationAgentEvent, AuthenticationUserEvent},
 };
+
+type HelperReader = BufReader<Box<dyn AsyncRead + Unpin + Send>>;
+type HelperWriter = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// Spawn the polkit authentication helper for `user`, returning its stdout
+/// reader and stdin writer. Prefers the agent socket, falling back to spawning
+/// the helper binary directly.
+async fn spawn_helper(
+    config: &SystemConfig,
+    user: &str,
+    cookie: &str,
+) -> Result<(HelperReader, HelperWriter)> {
+    if let Ok(stream) = UnixStream::connect(config.get_socket_path()).await {
+        let (read_half, write_half) = stream.into_split();
+        let mut writer: HelperWriter = Box::new(write_half);
+        writer.write_all(user.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.write_all(cookie.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        Ok((BufReader::new(Box::new(read_half)), writer))
+    } else {
+        let mut child = process::Command::new(config.get_helper_path())
+            .arg(user)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|_| {
+                PolkitError::Failed("Failed to the spawn polkit authentication helper.".to_string())
+            })?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(PolkitError::Failed("Child did not have stdin.".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(PolkitError::Failed("Child did not have stdout.".to_string()))?;
+
+        let mut writer: HelperWriter = Box::new(stdin);
+        writer.write_all(cookie.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        Ok((BufReader::new(Box::new(stdout)), writer))
+    }
+}
 
 #[derive(Debug)]
 pub struct AuthenticationAgent {
@@ -78,125 +124,183 @@ impl AuthenticationAgent {
             .send(AuthenticationAgentEvent::Started {
                 cookie: cookie.to_string(),
                 message: message.to_string(),
-                names,
+                names: names.clone(),
             })
             .await
             .map_err(|_| PolkitError::Failed("Failed to send data.".to_string()))?;
 
-        loop {
-            match &self.receiver.recv().await.ok_or_else(|| {
-                PolkitError::Failed("Failed to receive data. channel closed".to_string())
-            })? {
-                AuthenticationUserEvent::Canceled { cookie: c } => {
-                    if c == cookie {
-                        return Err(PolkitError::Cancelled(
-                            "User cancelled the authentication.".to_string(),
-                        ));
+        // Clone the sender so the `select!` loop below only ever borrows
+        // `self.receiver`, avoiding a double mutable borrow of `self`.
+        let sender = self.sender.clone();
+
+        // With a single identity, spawn the helper eagerly so a non-password
+        // module (fingerprint, security key) can prompt right away instead of
+        // forcing the user to type a password first. With multiple identities we
+        // wait for the user to pick one and submit. A failed attempt drops back
+        // to the submit-first flow so an instantly-failing module can't busy-loop.
+        let mut eager = names.len() == 1;
+        let default_user = names.first().cloned();
+
+        'retry: loop {
+            // Which user to authenticate as, plus any password already supplied.
+            let (username, mut cached_secret): (String, Option<String>) = if eager {
+                match &default_user {
+                    Some(u) => (u.clone(), None),
+                    None => {
+                        eager = false;
+                        continue 'retry;
                     }
                 }
-                AuthenticationUserEvent::ProvidedPassword {
-                    cookie: c,
-                    username: user,
-                    password: pw,
-                } => {
-                    if c == cookie {
-                        let mut stream = UnixStream::connect(self.config.get_socket_path()).await;
+            } else {
+                // Wait for the user to choose an identity and submit a password.
+                loop {
+                    let event = self.receiver.recv().await.ok_or_else(|| {
+                        PolkitError::Failed("Failed to receive data. channel closed".to_string())
+                    })?;
+                    // Match by reference: AuthenticationUserEvent is ZeroizeOnDrop,
+                    // so its fields can't be moved out.
+                    match &event {
+                        AuthenticationUserEvent::Canceled { cookie: c } if c == cookie => {
+                            return Err(PolkitError::Cancelled(
+                                "User cancelled the authentication.".to_string(),
+                            ));
+                        }
+                        AuthenticationUserEvent::ProvidedPassword {
+                            cookie: c,
+                            username,
+                            password,
+                        } if c == cookie => break (username.clone(), Some(password.clone())),
+                        _ => continue,
+                    }
+                }
+            };
 
-                        let (reader, mut writer): (
-                            BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
-                            Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-                        ) = if let Ok(stream) = &mut stream {
-                            let (read_half, mut write_half) = stream.split();
+            let (reader, mut writer) = spawn_helper(&self.config, &username, cookie).await?;
+            let mut lines: Lines<HelperReader> = reader.lines();
 
-                            write_half.write_all(user.as_bytes()).await?;
-                            write_half.write_all(b"\n").await?;
-                            write_half.write_all(cookie.as_bytes()).await?;
-                            write_half.write_all(b"\n").await?;
+            let mut last_info: Option<String> = None;
+            // True once the helper has asked us for a secret that we have not yet
+            // been able to provide (we are waiting on the user to type it).
+            let mut awaiting_secret = false;
 
-                            (BufReader::new(Box::new(read_half)), Box::new(write_half))
-                        } else {
-                            let mut child = process::Command::new(self.config.get_helper_path())
-                                .arg(user)
-                                .env("LC_ALL", "C")
-                                .stdin(Stdio::piped())
-                                .stdout(Stdio::piped())
-                                .spawn()
-                                .map_err(|_| {
-                                    PolkitError::Failed(
-                                        "Failed to the spawn polkit authentication helper."
-                                            .to_string(),
-                                    )
-                                })?;
+            loop {
+                // If the helper is blocked waiting on a secret and the user has
+                // since provided one, hand it over.
+                if awaiting_secret {
+                    if let Some(secret) = cached_secret.take() {
+                        writer.write_all(secret.as_bytes()).await?;
+                        writer.write_all(b"\n").await?;
+                        awaiting_secret = false;
+                    }
+                }
 
-                            let mut stdin = child.stdin.take().ok_or(PolkitError::Failed(
-                                "Child did not have stdin.".to_string(),
-                            ))?;
-                            let stdout = child.stdout.take().ok_or(PolkitError::Failed(
-                                "Child did not have stdout.".to_string(),
-                            ))?;
-
-                            stdin.write_all(cookie.as_bytes()).await?;
-                            stdin.write_all(b"\n").await?;
-
-                            (BufReader::new(Box::new(stdout)), Box::new(stdin))
+                tokio::select! {
+                    // Only pull the next helper line when we're not blocked owing
+                    // it a secret -- otherwise the helper is waiting on us, not
+                    // the other way around.
+                    line = lines.next_line(), if !awaiting_secret => {
+                        let Some(line) = line? else {
+                            // Helper closed the connection without a verdict.
+                            break;
                         };
+                        tracing::debug!("helper stdout: {}", line);
 
-                        let mut last_info: Option<String> = None;
-
-                        let mut lines = reader.lines();
-                        while let Some(line) = lines.next_line().await? {
-                            tracing::debug!("helper stdout: {}", line);
-                            if let Some(sliced) = line.strip_prefix("PAM_PROMPT_ECHO_OFF") {
-                                tracing::debug!("received request from helper: '{}'", sliced);
-                                if sliced.trim() == "Password:" {
-                                    tracing::debug!("helper replied with request for password");
-                                    writer.write_all(pw.as_bytes()).await?;
+                        if line
+                            .strip_prefix("PAM_PROMPT_ECHO_OFF")
+                            .or_else(|| line.strip_prefix("PAM_PROMPT_ECHO_ON"))
+                            .is_some()
+                        {
+                            // The helper wants input. Use a cached password if we
+                            // have one; otherwise record that we owe it a response
+                            // and wait for the user to provide it.
+                            match cached_secret.take() {
+                                Some(secret) => {
+                                    writer.write_all(secret.as_bytes()).await?;
                                     writer.write_all(b"\n").await?;
                                 }
-                            } else if let Some(info) = line.strip_prefix("PAM_TEXT_INFO") {
-                                let msg = info.trim().to_string();
-                                tracing::debug!("helper replied with info: {}", msg);
+                                None => awaiting_secret = true,
+                            }
+                        } else if let Some(info) = line.strip_prefix("PAM_TEXT_INFO") {
+                            let msg = info.trim().to_string();
+                            tracing::debug!("helper info: {}", msg);
+                            last_info = Some(msg.clone());
+                            sender
+                                .send(AuthenticationAgentEvent::Info {
+                                    cookie: cookie.to_string(),
+                                    message: msg,
+                                })
+                                .await
+                                .ok();
+                        } else if let Some(err) = line.strip_prefix("PAM_ERROR_MSG") {
+                            let msg = err.trim().to_string();
+                            tracing::debug!("helper error: {}", msg);
+                            last_info = Some(msg.clone());
+                            sender
+                                .send(AuthenticationAgentEvent::Info {
+                                    cookie: cookie.to_string(),
+                                    message: msg,
+                                })
+                                .await
+                                .ok();
+                        } else if line.starts_with("SUCCESS") {
+                            tracing::debug!("helper replied with success.");
+                            sender
+                                .send(AuthenticationAgentEvent::AuthorizationSucceeded {
+                                    cookie: cookie.to_string(),
+                                })
+                                .await
+                                .ok();
+                            return Ok(());
+                        } else if line.starts_with("FAILURE") {
+                            tracing::debug!("helper replied with failure.");
+                            break;
+                        }
+                    }
 
-                                if msg.contains("minute") && msg.contains("unlock") {
-                                    last_info = Some(msg.clone());
-                                    self.sender
-                                        .send(AuthenticationAgentEvent::AuthorizationRetry {
-                                            cookie: cookie.to_string(),
-                                            retry_message: Some(msg),
-                                        })
-                                        .await
-                                        .unwrap();
-                                }
-                            } else if line.starts_with("FAILURE") {
-                                tracing::debug!("helper replied with failure.");
-
-                                let retry_msg = last_info.clone().unwrap_or_else(|| {
-                                    gettext("Authentication failed. Please try again.")
-                                });
-                                self.sender
-                                    .send(AuthenticationAgentEvent::AuthorizationRetry {
-                                        cookie: cookie.to_string(),
-                                        retry_message: Some(retry_msg),
-                                    })
-                                    .await
-                                    .unwrap();
-                                continue;
-                            } else if line.starts_with("SUCCESS") {
-                                tracing::debug!("helper replied with success.");
-
-                                self.sender
-                                    .send(AuthenticationAgentEvent::AuthorizationSucceeded {
-                                        cookie: cookie.to_string(),
-                                    })
-                                    .await
-                                    .unwrap();
-                                return Ok(());
+                    // The user may act at any time: submit a password (possibly
+                    // while a fingerprint/security-key prompt is still pending) or
+                    // cancel the whole request.
+                    event = self.receiver.recv() => {
+                        // Match by reference: AuthenticationUserEvent is
+                        // ZeroizeOnDrop, so its fields can't be moved out.
+                        match &event {
+                            Some(AuthenticationUserEvent::ProvidedPassword {
+                                cookie: c,
+                                password,
+                                ..
+                            }) if c == cookie => cached_secret = Some(password.clone()),
+                            Some(AuthenticationUserEvent::Canceled { cookie: c })
+                                if c == cookie =>
+                            {
+                                return Err(PolkitError::Cancelled(
+                                    "User cancelled the authentication.".to_string(),
+                                ));
+                            }
+                            Some(_) => {}
+                            None => {
+                                return Err(PolkitError::Failed(
+                                    "Failed to receive data. channel closed".to_string(),
+                                ));
                             }
                         }
-                        writer.flush().await?;
                     }
                 }
             }
+
+            // Reached on FAILURE or EOF: prompt the user to retry, then re-run
+            // the stack. Fall back to submit-first so an instantly-failing
+            // module can't spin.
+            let retry_msg = last_info
+                .clone()
+                .unwrap_or_else(|| gettext("Authentication failed. Please try again."));
+            sender
+                .send(AuthenticationAgentEvent::AuthorizationRetry {
+                    cookie: cookie.to_string(),
+                    retry_message: Some(retry_msg),
+                })
+                .await
+                .ok();
+            eager = false;
         }
     }
 }

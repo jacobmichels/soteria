@@ -276,6 +276,17 @@ impl AsyncComponent for App {
                         }
                     }
                 }
+                AuthenticationAgentEvent::Info { cookie, message } => {
+                    // Surface PAM info/error text (e.g. "Place your finger on the
+                    // reader" or a security-key PIN prompt) in the status label.
+                    // The password entry stays editable so the user can still
+                    // type a password instead of using the alternate method.
+                    if let Some(c) = &self.cookie {
+                        if c == cookie {
+                            self.retry_message = Some(message.clone());
+                        }
+                    }
+                }
             },
         }
     }
