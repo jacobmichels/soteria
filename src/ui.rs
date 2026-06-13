@@ -144,13 +144,24 @@ impl AsyncComponent for App {
                 },
 
                 gtk::FlowBox {
-                    set_hexpand: true,
                     set_homogeneous: true,
                     set_margin_bottom: 16,
                     set_margin_top: 8,
-                    set_max_children_per_line: 2,
                     set_valign: gtk::Align::End,
                     set_vexpand: true,
+                    // With both buttons the row fills the width. When only Cancel
+                    // is shown, center it at its natural size instead of
+                    // stretching it across half a two-column layout.
+                    #[watch]
+                    set_hexpand: model.show_password,
+                    #[watch]
+                    set_max_children_per_line: if model.show_password { 2 } else { 1 },
+                    #[watch]
+                    set_halign: if model.show_password {
+                        gtk::Align::Fill
+                    } else {
+                        gtk::Align::Center
+                    },
 
                     #[name = "cancel_button"]
                     append = &gtk::Button::with_label(&gettext("Cancel")){
